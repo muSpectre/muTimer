@@ -132,3 +132,24 @@ def test_export():
     j = timer.to_json()
     assert "outer" in j
     assert "inner" in j
+
+
+def test_memory_tracking():
+    timer = Timer(track_memory=True)
+    with timer("mem_test"):
+        # Allocate some memory to ensure we exercise the code path
+        _ = [0] * 10000
+
+    assert timer.get_calls("mem_test") == 1
+    # Check that memory is non-negative and present
+    d = timer.summary_dict()
+    assert "memory" in d["mem_test"]
+    assert d["mem_test"]["memory"] >= 0.0
+
+
+def test_format_memory():
+    timer = Timer()
+    assert " B" in timer._format_memory(500)
+    assert "KB" in timer._format_memory(2048)
+    assert "MB" in timer._format_memory(2 * 1024**2)
+    assert "GB" in timer._format_memory(2 * 1024**3)

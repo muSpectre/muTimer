@@ -23,4 +23,5 @@ classifiers = [
 Homepage = "https://github.com/pastewka/muTimer"
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "psutil"]
+memory = ["psutil"]

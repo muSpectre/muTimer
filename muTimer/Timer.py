@@ -1,42 +1,15 @@
-#!/usr/bin/env python3
-# -*- coding:utf-8 -*-
-"""
-@file   Timer.py
-
-@author Lars Pastewka <lars.pastewka@imtek.uni-freiburg.de>
-
-@date   25 Dec 2024
-
-@brief  Hierarchical timing utility with nested context manager support
-
-Copyright © 2024 Lars Pastewka
-
-µGrid is free software; you can redistribute it and/or
-modify it under the terms of the GNU Lesser General Public License as
-published by the Free Software Foundation, either version 3, or (at
-your option) any later version.
-
-µGrid is distributed in the hope that it will be useful, but
-WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-Lesser General Public License for more details.
-
-You should have received a copy of the GNU Lesser General Public License
-along with µGrid; see the file COPYING. If not, write to the
-Free Software Foundation, Inc., 59 Temple Place - Suite 330,
-Boston, MA 02111-1307, USA.
-
-Additional permission under GNU GPL version 3 section 7
-
-If you modify this Program, or any covered work, by linking or combining it
-with proprietary FFT implementations or numerical libraries, containing parts
-covered by the terms of those libraries' licenses, the licensors of this
-Program grant you additional permission to convey the resulting work.
-"""
+# MIT License. See LICENSE file for details.
 
 import json
 import time
 from contextlib import contextmanager
+
+try:
+    import psutil
+
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 
 class Timer:
@@ -79,16 +52,25 @@ class Timer:
         ==============================================================================
     """
 
-    def __init__(self, use_papi=False):
+    def __init__(self, use_papi=False, track_memory=False):
         """
         Initialize the timer.
 
         Args:
             use_papi: Ignored (PAPI support has been removed).
+            track_memory: If True, tracks process memory (RSS) using psutil.
         """
         self._timers = {}  # name -> {"total": float, "calls": int, "children": list}
         self._stack = []  # stack of (name, start_time) for nesting
         self._roots = []  # top-level timer names in order of first use
+        self._track_memory = track_memory
+
+        if self._track_memory:
+            if not HAS_PSUTIL:
+                raise ImportError(
+                    "psutil is required for memory tracking. Install with 'pip install psutil'."
+                )
+            self._process = psutil.Process()
 
     @contextmanager
     def __call__(self, name: str, max_depth: int = None):
@@ -128,6 +110,7 @@ class Timer:
                 "total": 0.0,
                 "calls": 0,
                 "children": [],
+                "memory": 0.0,
             }
             # Track as root or as child of parent
             if self._stack:
@@ -139,16 +122,23 @@ class Timer:
                     self._roots.append(full_name)
 
         # Push onto stack and start timing
+        start_mem = self._process.memory_info().rss if self._track_memory else 0.0
         start = time.perf_counter()
-        self._stack.append((full_name, start, max_depth))
+        self._stack.append((full_name, start, max_depth, start_mem))
 
         try:
             yield
         finally:
             # Pop from stack and accumulate time
             elapsed = time.perf_counter() - start
+            elapsed_mem = (
+                (self._process.memory_info().rss - start_mem)
+                if self._track_memory
+                else 0.0
+            )
             self._stack.pop()
             self._timers[full_name]["total"] += elapsed
+            self._timers[full_name]["memory"] += max(0.0, elapsed_mem)
             self._timers[full_name]["calls"] += 1
 
     def _is_depth_allowed(self):
@@ -157,7 +147,8 @@ class Timer:
         Returns:
             bool, True if the timer is within all parent timer max_depth limits
         """
-        for i, (_, _, max_depth) in enumerate(self._stack):
+        for i, stack_item in enumerate(self._stack):
+            max_depth = stack_item[2]
             if max_depth is not None:
                 current_depth = len(self._stack) - i
                 if current_depth > max_depth:
@@ -231,6 +222,17 @@ class Timer:
         else:
             return f"{seconds:9.2e} s "
 
+    def _format_memory(self, bytes_val):
+        """Format memory with appropriate units."""
+        if bytes_val < 1024:
+            return f"{bytes_val:9.0f} B "
+        elif bytes_val < 1024**2:
+            return f"{bytes_val / 1024:9.2f} KB"
+        elif bytes_val < 1024**3:
+            return f"{bytes_val / 1024**2:9.2f} MB"
+        else:
+            return f"{bytes_val / 1024**3:9.2f} GB"
+
     def _collect_rows(self, name, indent=0, parent_time=None, rows=None):
         """Recursively collect timing data as rows for tabular display."""
         if rows is None:
@@ -239,6 +241,7 @@ class Timer:
         info = self._timers[name]
         total = info["total"]
         calls = info["calls"]
+        memory = info["memory"]
         avg = total / calls if calls > 0 else 0
 
         # Calculate percentage of parent time
@@ -259,6 +262,7 @@ class Timer:
                 "calls": calls,
                 "avg": avg if calls > 1 else None,
                 "pct": pct,
+                "memory": memory,
             }
         )
 
@@ -269,7 +273,9 @@ class Timer:
         # Add "other" time if there are children
         if info["children"]:
             children_time = sum(self._timers[c]["total"] for c in info["children"])
+            children_memory = sum(self._timers[c]["memory"] for c in info["children"])
             other_time = total - children_time
+            other_memory = max(0.0, memory - children_memory)
             if other_time < 0:
                 import warnings
 
@@ -277,7 +283,7 @@ class Timer:
                     f"Timer overhead detected or total time is less than children time for '{name}'."
                 )
                 other_time = 0.0
-            if other_time > 1e-9:  # Only show if meaningful
+            if other_time > 1e-9 or other_memory > 0:  # Only show if meaningful
                 other_pct = 100.0 * other_time / total if total > 0 else 0
                 rows.append(
                     {
@@ -287,6 +293,7 @@ class Timer:
                         "calls": None,
                         "avg": None,
                         "pct": other_pct,
+                        "memory": other_memory,
                     }
                 )
 
@@ -313,15 +320,25 @@ class Timer:
         if title is None:
             title = "Timing Summary"
 
-        line_width = 78
+        line_width = 92 if self._track_memory else 78
         print(f"\n{'=' * line_width}")
         print(title)
         print(f"{'=' * line_width}")
-        print(
-            f"{'Name':<{name_width}} {'Total':>12} {'Calls':>8} "
-            f"{'Average':>12} {'% Parent':>10}"
-        )
-        print(f"{'-' * name_width} {'-' * 12} {'-' * 8} {'-' * 12} {'-' * 10}")
+
+        if self._track_memory:
+            print(
+                f"{'Name':<{name_width}} {'Total':>12} {'Calls':>8} "
+                f"{'Average':>12} {'% Parent':>10} {'Memory':>12}"
+            )
+            print(
+                f"{'-' * name_width} {'-' * 12} {'-' * 8} {'-' * 12} {'-' * 10} {'-' * 12}"
+            )
+        else:
+            print(
+                f"{'Name':<{name_width}} {'Total':>12} {'Calls':>8} "
+                f"{'Average':>12} {'% Parent':>10}"
+            )
+            print(f"{'-' * name_width} {'-' * 12} {'-' * 8} {'-' * 12} {'-' * 10}")
 
         # Print rows
         for row in all_rows:
@@ -349,7 +366,15 @@ class Timer:
             else:
                 avg_str = f"{'-':>12}"
 
-            print(f"{name:<{name_width}} {total_str} {calls_str} {avg_str} {pct_str}")
+            if self._track_memory:
+                mem_str = self._format_memory(row.get("memory", 0.0))
+                print(
+                    f"{name:<{name_width}} {total_str} {calls_str} {avg_str} {pct_str} {mem_str}"
+                )
+            else:
+                print(
+                    f"{name:<{name_width}} {total_str} {calls_str} {avg_str} {pct_str}"
+                )
 
         print(f"{'=' * line_width}")
 
@@ -366,12 +391,23 @@ class Timer:
             "avg_seconds": total / calls if calls > 0 else 0,
         }
 
+        if self._track_memory:
+            result["memory_bytes"] = info.get("memory", 0.0)
+
         if info["children"]:
             result["children"] = [self._build_tree(child) for child in info["children"]]
             children_time = sum(self._timers[c]["total"] for c in info["children"])
             other_time = total - children_time
             if other_time > 1e-9:
                 result["other_seconds"] = other_time
+
+            if self._track_memory:
+                children_memory = sum(
+                    self._timers[c]["memory"] for c in info["children"]
+                )
+                other_memory = max(0.0, info.get("memory", 0.0) - children_memory)
+                if other_memory > 0:
+                    result["other_memory_bytes"] = other_memory
 
         return result
 
@@ -412,5 +448,7 @@ class Timer:
                 "avg": info["total"] / info["calls"] if info["calls"] > 0 else 0,
                 "children": list(info["children"]),
             }
+            if self._track_memory:
+                entry["memory"] = info.get("memory", 0.0)
             result[name] = entry
         return result
