@@ -1,24 +1,26 @@
 [build-system]
-requires = ["setuptools>=42", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
 
 [project]
 name = "muTimer"
-version = "0.1.0"
+version = "1.0.0"
 description = "Hierarchical timing utility with nested context manager support"
 authors = [
     {name = "Lars Pastewka", email = "lars.pastewka@imtek.uni-freiburg.de"},
-    {name = "Christoph Huber", email = "christoph.huber@kit.edu"},
-    {name = "Claude", email = "noreply@anthropic.com"}
+    {name = "Christoph Huber", email = "christoph.huber@kit.edu"}
 ]
 readme = "README.md"
 requires-python = ">=3.7"
-license = {text = "LGPL-3.0-or-later"}
+license = {text = "MIT"}
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)",
+    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 
 [project.urls]
 Homepage = "https://github.com/pastewka/muTimer"
+
+[project.optional-dependencies]
+test = ["pytest"]

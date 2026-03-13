@@ -36,7 +36,6 @@ Program grant you additional permission to convey the resulting work.
 
 import json
 import time
-import warnings
 from contextlib import contextmanager
 
 
@@ -183,7 +182,7 @@ class Timer:
         for full_name in self._timers:
             if full_name.endswith("/" + name) or full_name == name:
                 matches.append(self._timers[full_name]["total"])
-        
+
         if len(matches) > 1:
             raise ValueError(f"Ambiguous timer name '{name}'. Multiple matches found.")
         elif len(matches) == 1:
@@ -206,7 +205,7 @@ class Timer:
         for full_name in self._timers:
             if full_name.endswith("/" + name) or full_name == name:
                 matches.append(self._timers[full_name]["calls"])
-        
+
         if len(matches) > 1:
             raise ValueError(f"Ambiguous timer name '{name}'. Multiple matches found.")
         elif len(matches) == 1:
@@ -273,7 +272,10 @@ class Timer:
             other_time = total - children_time
             if other_time < 0:
                 import warnings
-                warnings.warn(f"Timer overhead detected or total time is less than children time for '{name}'.")
+
+                warnings.warn(
+                    f"Timer overhead detected or total time is less than children time for '{name}'."
+                )
                 other_time = 0.0
             if other_time > 1e-9:  # Only show if meaningful
                 other_pct = 100.0 * other_time / total if total > 0 else 0
@@ -347,9 +349,7 @@ class Timer:
             else:
                 avg_str = f"{'-':>12}"
 
-            print(
-                f"{name:<{name_width}} {total_str} {calls_str} {avg_str} {pct_str}"
-            )
+            print(f"{name:<{name_width}} {total_str} {calls_str} {avg_str} {pct_str}")
 
         print(f"{'=' * line_width}")
 
@@ -367,9 +367,7 @@ class Timer:
         }
 
         if info["children"]:
-            result["children"] = [
-                self._build_tree(child) for child in info["children"]
-            ]
+            result["children"] = [self._build_tree(child) for child in info["children"]]
             children_time = sum(self._timers[c]["total"] for c in info["children"])
             other_time = total - children_time
             if other_time > 1e-9:
