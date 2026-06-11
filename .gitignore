@@ -40,6 +40,6 @@ venv.bak/
 *~
 
 # Coding agents
-.junie
+.junie/
 
 muTimer/_version.py

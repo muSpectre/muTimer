@@ -153,3 +153,151 @@ def test_format_memory():
     assert "KB" in timer._format_memory(2048)
     assert "MB" in timer._format_memory(2 * 1024**2)
     assert "GB" in timer._format_memory(2 * 1024**3)
+
+
+class FakeMPIComm:
+    """Minimal mpi4py-like communicator backed by a shared store."""
+
+    def __init__(self, rank, size, store):
+        self._rank = rank
+        self._size = size
+        self._store = store
+
+    def Get_rank(self):
+        return self._rank
+
+    def Get_size(self):
+        return self._size
+
+    def gather(self, obj, root=0):
+        self._store[self._rank] = obj
+        if self._rank == root:
+            return [self._store[r] for r in range(self._size)]
+        return None
+
+
+class FakeMuGridComm:
+    """Minimal muGrid-style communicator wrapping an mpi4py communicator."""
+
+    def __init__(self, mpi4py_comm):
+        self.mpi4py_comm = mpi4py_comm
+
+    @property
+    def rank(self):
+        return self.mpi4py_comm.Get_rank()
+
+    @property
+    def size(self):
+        return self.mpi4py_comm.Get_size()
+
+
+class FakeNoGatherComm:
+    """muGrid-style communicator without an underlying mpi4py communicator."""
+
+    def __init__(self, rank, size):
+        self.rank = rank
+        self.size = size
+
+
+def _make_rank_timer(comm, seconds):
+    timer = Timer(comm=comm)
+    timer._timers["work"] = {
+        "total": seconds,
+        "calls": 2,
+        "children": [],
+        "memory": 0.0,
+    }
+    timer._roots.append("work")
+    return timer
+
+
+def test_mpi_summary_prints_once(capsys):
+    store = {}
+    comm0 = FakeMPIComm(0, 2, store)
+    comm1 = FakeMPIComm(1, 2, store)
+    timer0 = _make_rank_timer(comm0, 1.0)
+    timer1 = _make_rank_timer(comm1, 3.0)
+
+    # Non-root ranks contribute their data but print nothing
+    timer1.print_summary()
+    assert capsys.readouterr().out == ""
+
+    timer0.print_summary()
+    out = capsys.readouterr().out
+    assert "Timing Summary (2 MPI processes)" in out
+    assert "Mean" in out and "Min" in out and "Max" in out
+    # mean 2 s, min 1 s, max 3 s
+    assert "2.0000 s" in out
+    assert "1.0000 s" in out
+    assert "3.0000 s" in out
+
+
+def test_mpi_summary_with_mugrid_style_comm(capsys):
+    store = {}
+    comm0 = FakeMuGridComm(FakeMPIComm(0, 2, store))
+    comm1 = FakeMuGridComm(FakeMPIComm(1, 2, store))
+    timer0 = _make_rank_timer(comm0, 1.0)
+    timer1 = _make_rank_timer(comm1, 3.0)
+
+    timer1.print_summary()
+    assert capsys.readouterr().out == ""
+
+    timer0.print_summary()
+    out = capsys.readouterr().out
+    assert "Timing Summary (2 MPI processes)" in out
+    assert "2.0000 s" in out
+
+
+def test_mpi_summary_timer_missing_on_some_ranks(capsys):
+    store = {}
+    comm0 = FakeMPIComm(0, 2, store)
+    comm1 = FakeMPIComm(1, 2, store)
+    timer0 = _make_rank_timer(comm0, 4.0)
+    timer1 = Timer(comm=comm1)  # never timed anything
+
+    timer1.print_summary()
+    assert capsys.readouterr().out == ""
+
+    timer0.print_summary()
+    out = capsys.readouterr().out
+    # mean 2 s, min 0 s, max 4 s
+    assert "2.0000 s" in out
+    assert "0.00 ns" in out
+    assert "4.0000 s" in out
+
+
+def test_mpi_summary_without_gather_prints_rank0_only(capsys):
+    timer1 = _make_rank_timer(FakeNoGatherComm(1, 2), 3.0)
+    timer1.print_summary()
+    assert capsys.readouterr().out == ""
+
+    timer0 = _make_rank_timer(FakeNoGatherComm(0, 2), 1.0)
+    timer0.print_summary()
+    out = capsys.readouterr().out
+    # Falls back to the local (serial-style) summary on rank 0
+    assert "Timing Summary" in out
+    assert "MPI processes" not in out
+    assert "1.0000 s" in out
+
+
+def test_comm_argument_overrides_constructor(capsys):
+    timer = _make_rank_timer(None, 1.0)
+    timer.print_summary(comm=FakeNoGatherComm(1, 2))
+    assert capsys.readouterr().out == ""
+
+
+def test_serial_comm_keeps_serial_format(capsys):
+    timer = _make_rank_timer(FakeNoGatherComm(0, 1), 1.0)
+    timer.print_summary()
+    out = capsys.readouterr().out
+    assert "Total" in out and "Average" in out
+    assert "MPI processes" not in out
+
+
+def test_serial_mpi4py_style_comm_keeps_serial_format(capsys):
+    # Shape of mpi4py's COMM_WORLD and of NuMPI's serial stub
+    timer = _make_rank_timer(FakeMPIComm(0, 1, {}), 1.0)
+    timer.print_summary()
+    out = capsys.readouterr().out
+    assert "Total" in out and "Average" in out
+    assert "MPI processes" not in out

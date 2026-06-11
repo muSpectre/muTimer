@@ -12,6 +12,65 @@ except ImportError:
     HAS_PSUTIL = False
 
 
+def _comm_rank_size(comm):
+    """Extract (rank, size) from an mpi4py- or muGrid-style communicator."""
+    if hasattr(comm, "Get_rank"):  # mpi4py interface
+        return comm.Get_rank(), comm.Get_size()
+    return comm.rank, comm.size  # muGrid-style properties
+
+
+def _find_object_gather_comm(comm):
+    """Find a communicator capable of gathering Python objects.
+
+    Returns an mpi4py-style communicator (one with a lowercase ``gather``
+    method that pickles arbitrary objects), or None if the given
+    communicator provides no such interface.
+    """
+    if hasattr(comm, "gather") and hasattr(comm, "Get_rank"):
+        return comm
+    # muGrid's CommunicatorWrapper exposes the underlying mpi4py
+    # communicator as ``mpi4py_comm``
+    candidate = getattr(comm, "mpi4py_comm", None)
+    if hasattr(candidate, "gather") and hasattr(candidate, "Get_rank"):
+        return candidate
+    return None
+
+
+def _merge_gathered_timers(gathered):
+    """Merge per-rank (timers, roots) pairs into a single timer tree.
+
+    For each timer, "total" becomes the mean over all ranks (ranks that
+    never entered the timer contribute zero) and "min"/"max" hold the
+    extreme per-rank totals. "calls" and "memory" are maxima over ranks.
+    """
+    nb_ranks = len(gathered)
+    merged = {}
+    roots = []
+    for timers, rank_roots in gathered:
+        for name in rank_roots:
+            if name not in roots:
+                roots.append(name)
+        for name, info in timers.items():
+            entry = merged.setdefault(
+                name,
+                {"totals": [], "calls": 0, "children": [], "memory": 0.0},
+            )
+            entry["totals"].append(info["total"])
+            entry["calls"] = max(entry["calls"], info["calls"])
+            entry["memory"] = max(entry["memory"], info.get("memory", 0.0))
+            for child in info["children"]:
+                if child not in entry["children"]:
+                    entry["children"].append(child)
+    for entry in merged.values():
+        totals = entry.pop("totals")
+        if len(totals) < nb_ranks:  # timer missing on some ranks
+            totals += [0.0] * (nb_ranks - len(totals))
+        entry["total"] = sum(totals) / nb_ranks
+        entry["min"] = min(totals)
+        entry["max"] = max(totals)
+    return merged, roots
+
+
 class Timer:
     """
     Hierarchical timing utility with nested context manager support.
@@ -22,6 +81,8 @@ class Timer:
     - Call counting for repeated operations
     - Hierarchical summary output in tabular format
     - Optional depth limiting for nested timers
+    - MPI-aware summaries: pass a communicator (mpi4py or muGrid style) to
+      print a single summary on rank 0 with min/mean/max across ranks
 
     Note: The `Timer` class is NOT thread-safe. Do not share a single
     `Timer` instance across multiple threads concurrently.
@@ -52,18 +113,22 @@ class Timer:
         ==============================================================================
     """
 
-    def __init__(self, use_papi=False, track_memory=False):
+    def __init__(self, use_papi=False, track_memory=False, comm=None):
         """
         Initialize the timer.
 
         Args:
             use_papi: Ignored (PAPI support has been removed).
             track_memory: If True, tracks process memory (RSS) using psutil.
+            comm: Optional MPI communicator (mpi4py or muGrid style) used by
+                  `print_summary` to produce a single summary on rank 0
+                  instead of one per process.
         """
         self._timers = {}  # name -> {"total": float, "calls": int, "children": list}
         self._stack = []  # stack of (name, start_time) for nesting
         self._roots = []  # top-level timer names in order of first use
         self._track_memory = track_memory
+        self._comm = comm
 
         if self._track_memory:
             if not HAS_PSUTIL:
@@ -233,12 +298,14 @@ class Timer:
         else:
             return f"{bytes_val / 1024**3:9.2f} GB"
 
-    def _collect_rows(self, name, indent=0, parent_time=None, rows=None):
+    def _collect_rows(self, name, indent=0, parent_time=None, rows=None, timers=None):
         """Recursively collect timing data as rows for tabular display."""
         if rows is None:
             rows = []
+        if timers is None:
+            timers = self._timers
 
-        info = self._timers[name]
+        info = timers[name]
         total = info["total"]
         calls = info["calls"]
         memory = info["memory"]
@@ -263,17 +330,19 @@ class Timer:
                 "avg": avg if calls > 1 else None,
                 "pct": pct,
                 "memory": memory,
+                "min": info.get("min"),
+                "max": info.get("max"),
             }
         )
 
         # Collect children
         for child in info["children"]:
-            self._collect_rows(child, indent + 1, total, rows)
+            self._collect_rows(child, indent + 1, total, rows, timers)
 
         # Add "other" time if there are children
         if info["children"]:
-            children_time = sum(self._timers[c]["total"] for c in info["children"])
-            children_memory = sum(self._timers[c]["memory"] for c in info["children"])
+            children_time = sum(timers[c]["total"] for c in info["children"])
+            children_memory = sum(timers[c]["memory"] for c in info["children"])
             other_time = total - children_time
             other_memory = max(0.0, memory - children_memory)
             if other_time < 0:
@@ -299,46 +368,83 @@ class Timer:
 
         return rows
 
-    def print_summary(self, title=None, name_width=30):
+    def print_summary(self, title=None, name_width=30, comm=None):
         """
         Print hierarchical timing summary in tabular format.
+
+        When running under MPI on more than one process and a communicator
+        is available (either passed here or to the constructor), timing data
+        is gathered to rank 0 and a single summary is printed there, showing
+        the mean, minimum and maximum time across ranks; all other ranks
+        print nothing. Gathering requires an mpi4py communicator (muGrid
+        communicators created from one work too); without it, rank 0 prints
+        its local timings only.
 
         Args:
             title: Title for the summary section (default: "Timing Summary")
             name_width: Width of the name column (default: 30)
+            comm: Optional MPI communicator (mpi4py or muGrid style).
+                  Overrides the communicator passed to the constructor.
         """
-        if not self._timers:
+        if comm is None:
+            comm = self._comm
+        rank, size = (0, 1) if comm is None else _comm_rank_size(comm)
+
+        timers = self._timers
+        roots = self._roots
+        parallel = False
+        if size > 1:
+            gather_comm = _find_object_gather_comm(comm)
+            if gather_comm is not None:
+                # Collective call: every rank must participate in the gather
+                gathered = gather_comm.gather((self._timers, self._roots), root=0)
+                if rank == 0:
+                    timers, roots = _merge_gathered_timers(gathered)
+                    parallel = True
+            if rank != 0:
+                return
+
+        if not timers:
             print("No timing data collected.")
             return
 
         # Collect all rows
         all_rows = []
-        for root in self._roots:
-            self._collect_rows(root, rows=all_rows)
+        for root in roots:
+            self._collect_rows(root, rows=all_rows, timers=timers)
 
         # Determine title
         if title is None:
             title = "Timing Summary"
+        if parallel:
+            title += f" ({size} MPI processes)"
 
+        # In parallel mode, the Total/Average columns are replaced by
+        # Mean/Min/Max across ranks (13 extra characters)
         line_width = 92 if self._track_memory else 78
+        if parallel:
+            line_width += 13
         print(f"\n{'=' * line_width}")
         print(title)
         print(f"{'=' * line_width}")
 
+        if parallel:
+            time_header = f"{'Mean':>12} {'Min':>12} {'Max':>12}"
+            time_rule = f"{'-' * 12} {'-' * 12} {'-' * 12}"
+        else:
+            time_header = f"{'Total':>12} {'Calls':>8} {'Average':>12}"
+            time_rule = f"{'-' * 12} {'-' * 8} {'-' * 12}"
+        if parallel:
+            time_header += f" {'Calls':>8}"
+            time_rule += f" {'-' * 8}"
         if self._track_memory:
             print(
-                f"{'Name':<{name_width}} {'Total':>12} {'Calls':>8} "
-                f"{'Average':>12} {'% Parent':>10} {'Memory':>12}"
+                f"{'Name':<{name_width}} {time_header} {'% Parent':>10} {'Memory':>12}"
             )
-            print(
-                f"{'-' * name_width} {'-' * 12} {'-' * 8} {'-' * 12} {'-' * 10} {'-' * 12}"
-            )
+            print(f"{'-' * name_width} {time_rule} {'-' * 10} {'-' * 12}")
         else:
-            print(
-                f"{'Name':<{name_width}} {'Total':>12} {'Calls':>8} "
-                f"{'Average':>12} {'% Parent':>10}"
-            )
-            print(f"{'-' * name_width} {'-' * 12} {'-' * 8} {'-' * 12} {'-' * 10}")
+            print(f"{'Name':<{name_width}} {time_header} {'% Parent':>10}")
+            print(f"{'-' * name_width} {time_rule} {'-' * 10}")
 
         # Print rows
         for row in all_rows:
@@ -361,20 +467,26 @@ class Timer:
             else:
                 pct_str = f"{'-':>10}"
 
-            if row["avg"] is not None:
-                avg_str = self._format_time(row["avg"])
+            if parallel:
+                if row.get("min") is not None:
+                    min_str = self._format_time(row["min"])
+                    max_str = self._format_time(row["max"])
+                else:
+                    min_str = f"{'-':>12}"
+                    max_str = f"{'-':>12}"
+                time_cols = f"{total_str} {min_str} {max_str} {calls_str}"
             else:
-                avg_str = f"{'-':>12}"
+                if row["avg"] is not None:
+                    avg_str = self._format_time(row["avg"])
+                else:
+                    avg_str = f"{'-':>12}"
+                time_cols = f"{total_str} {calls_str} {avg_str}"
 
             if self._track_memory:
                 mem_str = self._format_memory(row.get("memory", 0.0))
-                print(
-                    f"{name:<{name_width}} {total_str} {calls_str} {avg_str} {pct_str} {mem_str}"
-                )
+                print(f"{name:<{name_width}} {time_cols} {pct_str} {mem_str}")
             else:
-                print(
-                    f"{name:<{name_width}} {total_str} {calls_str} {avg_str} {pct_str}"
-                )
+                print(f"{name:<{name_width}} {time_cols} {pct_str}")
 
         print(f"{'=' * line_width}")
 
