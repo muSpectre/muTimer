@@ -1,5 +1,6 @@
 # MIT License. See LICENSE file for details.
 
+import inspect
 import json
 import time
 from contextlib import contextmanager
@@ -19,19 +20,32 @@ def _comm_rank_size(comm):
     return comm.rank, comm.size  # muGrid-style properties
 
 
-def _find_object_gather_comm(comm):
-    """Find a communicator capable of gathering Python objects.
+def _gathers_objects(comm):
+    """Whether ``comm.gather(obj, root=0)`` gathers Python objects.
 
-    Returns an mpi4py-style communicator (one with a lowercase ``gather``
-    method that pickles arbitrary objects), or None if the given
-    communicator provides no such interface.
+    True for mpi4py communicators and for muGrid communicators from 1.6 on,
+    whose ``gather`` takes ``root``; muGrid's earlier ``gather`` was an
+    array concatenation without ``root`` and is left alone.
     """
-    if hasattr(comm, "gather") and hasattr(comm, "Get_rank"):
+    gather = getattr(comm, "gather", None)
+    if gather is None:
+        return False
+    if hasattr(comm, "Get_rank"):  # mpi4py's interface
+        return True
+    try:
+        return "root" in inspect.signature(gather).parameters
+    except (TypeError, ValueError):  # no introspectable signature
+        return False
+
+
+def _find_object_gather_comm(comm):
+    """Find a communicator capable of gathering Python objects: the given
+    one, or the mpi4py communicator a muGrid communicator was made from
+    (``mpi4py_comm``); None if there is neither."""
+    if _gathers_objects(comm):
         return comm
-    # muGrid's CommunicatorWrapper exposes the underlying mpi4py
-    # communicator as ``mpi4py_comm``
     candidate = getattr(comm, "mpi4py_comm", None)
-    if hasattr(candidate, "gather") and hasattr(candidate, "Get_rank"):
+    if candidate is not None and _gathers_objects(candidate):
         return candidate
     return None
 
@@ -376,9 +390,9 @@ class Timer:
         is available (either passed here or to the constructor), timing data
         is gathered to rank 0 and a single summary is printed there, showing
         the mean, minimum and maximum time across ranks; all other ranks
-        print nothing. Gathering requires an mpi4py communicator (muGrid
-        communicators created from one work too); without it, rank 0 prints
-        its local timings only.
+        print nothing. Gathering needs a communicator whose ``gather`` takes
+        Python objects -- mpi4py's, or muGrid's from 1.6 on; without one,
+        rank 0 prints its local timings only.
 
         Args:
             title: Title for the summary section (default: "Timing Summary")

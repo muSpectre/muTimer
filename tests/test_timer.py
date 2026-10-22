@@ -301,3 +301,36 @@ def test_serial_mpi4py_style_comm_keeps_serial_format(capsys):
     out = capsys.readouterr().out
     assert "Total" in out and "Average" in out
     assert "MPI processes" not in out
+
+
+def test_object_gather_detection():
+    from muTimer.Timer import _find_object_gather_comm
+
+    class Mpi4pyLike:
+        def Get_rank(self):
+            return 0
+
+        def gather(self, obj, root=0):
+            return [obj]
+
+    class MuGridLike:  # muGrid >= 1.6: gather takes root, no Get_rank
+        rank = 0
+
+        def gather(self, obj, root=0):
+            return [obj]
+
+    class OldMuGridLike:  # muGrid < 1.6: gather concatenated arrays
+        rank = 0
+        mpi4py_comm = None
+
+        def gather(self, arg):
+            return arg
+
+    class Wrapped(OldMuGridLike):
+        mpi4py_comm = Mpi4pyLike()
+
+    assert _find_object_gather_comm(Mpi4pyLike()) is not None
+    assert _find_object_gather_comm(MuGridLike()) is not None
+    assert _find_object_gather_comm(OldMuGridLike()) is None
+    assert isinstance(_find_object_gather_comm(Wrapped()), Mpi4pyLike)
+    assert _find_object_gather_comm(object()) is None
